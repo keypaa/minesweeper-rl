@@ -96,7 +96,7 @@ plots/
 .oh-my-zsh/
 
 # Utility scripts (if you want to commit these, remove from .gitignore)
-monitor_gpu.sh
+#monitor_gpu.sh
 view_plots.py
 
 # Testing
