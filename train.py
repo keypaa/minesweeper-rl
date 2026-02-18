@@ -60,7 +60,8 @@ def get_timestamp():
     """Get formatted timestamp for logging"""
     return datetime.now().strftime('%H:%M:%S')
 
-def train(device_name='auto', num_episodes=1000):
+def train(device_name='auto', num_episodes=1000, model='auto', width=9, height=9, mines=10,
+          visualize=False, visualize_interval=500, play_after=0, save_path=None):
     """Train the Minesweeper agent
     
     Args:
@@ -92,11 +93,18 @@ def train(device_name='auto', num_episodes=1000):
     reward_history = []
     time_history = []
     
-    # Create environments with device-appropriate settings
+    # Create environments with device-appropriate settings and chosen board size
     num_envs = config['num_envs']
-    env = AsyncVectorEnv([lambda: MinesweeperEnv() for _ in range(num_envs)])
-    single_env = MinesweeperEnv()
-    agent = MinesweeperAgent(single_env.height, single_env.width, 512, device=device)
+    # Use factory to avoid late-binding closure issues
+    def make_env(w, h, m):
+        def _th():
+            return MinesweeperEnv(w, h, m)
+        return _th
+
+    env = AsyncVectorEnv([make_env(width, height, mines) for _ in range(num_envs)])
+    single_env = MinesweeperEnv(width, height, mines)
+    # Create agent with chosen model size
+    agent = MinesweeperAgent(single_env.height, single_env.width, 512, device=device, model=model)
     agent.to(device)
     
     # Compile model for faster execution (PyTorch 2.0+) - only on GPU
@@ -106,7 +114,12 @@ def train(device_name='auto', num_episodes=1000):
         agent.target_net = torch.compile(agent.target_net, mode='max-autotune')
     
     optimizer = optim.AdamW(agent.parameters(), lr=0.0003, weight_decay=1e-5)
-    gui = MinesweeperGUI(single_env, agent)
+    # Defer GUI creation until needed. Creating a headless GUI early sets SDL_VIDEODRIVER
+    # and can prevent later visible windows in the same process.
+    gui = None
+    if visualize:
+        # If user wants visualization during training, create a visible GUI
+        gui = MinesweeperGUI(single_env, agent, headless=False)
 
     # Device-specific batch size and buffer
     replay_buffer = deque(maxlen=config['replay_buffer_size'])
@@ -116,7 +129,8 @@ def train(device_name='auto', num_episodes=1000):
     
     # Mixed precision training for faster computation (GPU only)
     if config['use_amp']:
-        scaler = GradScaler(AMP_DEVICE) if AMP_DEVICE else GradScaler()
+        # GradScaler does not take a device argument in common APIs
+        scaler = GradScaler()
         print(f"[{get_timestamp()}] Using mixed precision training (AMP) for faster GPU computation")
     else:
         scaler = None
@@ -150,7 +164,10 @@ def train(device_name='auto', num_episodes=1000):
     while episode_count < num_episodes:
         epsilon = max(0.05, 0.9 - episode_count * 0.002)
         actions = agent.get_actions_batch(obs, epsilon)
-        next_obs, rewards, dones_step, _, _ = env.step(actions)
+        # AsyncVectorEnv.step returns (obs, rewards, terminations, truncations, infos)
+        next_obs, rewards, terminations, truncations, _ = env.step(actions)
+        # Treat either termination or truncation as episode done
+        dones_step = np.logical_or(terminations, truncations)
         global_step += num_envs
         
         for i in range(num_envs):
@@ -186,7 +203,8 @@ def train(device_name='auto', num_episodes=1000):
                 step_counts[i] = 0
         
         # Train with device-appropriate number of updates per step
-        if len(replay_buffer) >= warmup_steps:
+        # Ensure we have at least a full batch available before sampling
+        if len(replay_buffer) >= max(warmup_steps, batch_size):
             for _ in range(updates_per_step):
                 batch = random.sample(replay_buffer, batch_size)
                 
@@ -202,7 +220,8 @@ def train(device_name='auto', num_episodes=1000):
                 
                 if config['use_amp']:
                     # Mixed precision training for faster computation (GPU)
-                    autocast_ctx = autocast(AMP_DEVICE) if AMP_DEVICE else autocast()
+                    # Use explicit device_type for autocast when available
+                    autocast_ctx = autocast(device_type='cuda') if AMP_DEVICE == 'cuda' else autocast()
                     with autocast_ctx:
                         # Double DQN: use main network to select action, target network to evaluate
                         q_values = agent(obs_batch)
@@ -247,8 +266,9 @@ def train(device_name='auto', num_episodes=1000):
         # AsyncVectorEnv automatically resets done environments
         obs = next_obs
         
-        if episode_count % 500 == 0 and episode_count > 0:
+        if visualize and episode_count % visualize_interval == 0 and episode_count > 0:
             print(f"[{get_timestamp()}] Visualizing episode {episode_count}...")
+            # run a visual episode (GUI handles headless mode internally)
             gui.run_episode()
     
     # Final plot
@@ -259,6 +279,23 @@ def train(device_name='auto', num_episodes=1000):
     print(f"[{get_timestamp()}] Total updates: {update_count}, Total steps: {global_step}")
     print(f"[{get_timestamp()}] Total training time: {elapsed/60:.1f} minutes ({elapsed/3600:.2f} hours)")
     print(f"[{get_timestamp()}] Average speed: {episode_count/elapsed:.1f} episodes/second")
+
+    # Optionally play a few visual episodes after training completes
+    if play_after and play_after > 0:
+        print(f"[{get_timestamp()}] Playing {play_after} visual episode(s) with trained agent...")
+        # Ensure GUI is visible for playback
+        play_gui = MinesweeperGUI(single_env, agent, headless=False)
+        for i in range(play_after):
+            print(f"[{get_timestamp()}] Playing episode {i+1}/{play_after}...")
+            play_gui.run_episode()
+    # Optionally save model after training
+    if save_path:
+        print(f"[{get_timestamp()}] Saving trained model to {save_path}...")
+        # Save CPU-friendly checkpoint by moving network state dicts to CPU
+        agent_cpu = agent.to(torch.device('cpu'))
+        agent_cpu.save(save_path, extra={'episodes': episode_count})
+        # Move back to original device
+        agent.to(device)
 
 def plot_training_progress(episodes, win_rates, rewards, times):
     """Plot and save training progress graphs"""
@@ -330,6 +367,18 @@ if __name__ == "__main__":
                         help='Device to train on (auto: use CUDA if available, otherwise CPU)')
     parser.add_argument('--episodes', type=int, default=1000,
                         help='Number of episodes to train for (default: 1000)')
+    parser.add_argument('--model', type=str, default='auto', choices=['auto', 'small', 'large'],
+                        help='Model size: small (CPU-friendly), large (GPU-optimized), auto (choose based on device)')
+    parser.add_argument('--width', type=int, default=9, help='Board width (default 9)')
+    parser.add_argument('--height', type=int, default=9, help='Board height (default 9)')
+    parser.add_argument('--mines', type=int, default=10, help='Number of mines (default 10)')
+    parser.add_argument('--visualize', action='store_true', help='Visualize occasional episodes during training')
+    parser.add_argument('--visualize-interval', type=int, default=500, help='Episodes between visualizations')
+    parser.add_argument('--play-after', type=int, default=0, help='Play N visual episodes after training completes')
+    parser.add_argument('--save-path', type=str, default=None, help='Path to save trained model (optional)')
     args = parser.parse_args()
     
-    train(device_name=args.device, num_episodes=args.episodes)
+    train(device_name=args.device, num_episodes=args.episodes, model=args.model,
+          width=args.width, height=args.height, mines=args.mines,
+          visualize=args.visualize, visualize_interval=args.visualize_interval,
+          play_after=args.play_after, save_path=args.save_path)

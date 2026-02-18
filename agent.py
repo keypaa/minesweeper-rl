@@ -4,7 +4,7 @@ import torch.optim as optim
 import numpy as np
 
 class MinesweeperAgent(nn.Module):
-    def __init__(self, height, width, hidden_size=4096, device=None):
+    def __init__(self, height, width, hidden_size=4096, device=None, model='auto'):
         super().__init__()
         self.height = height
         self.width = width
@@ -15,73 +15,112 @@ class MinesweeperAgent(nn.Module):
             device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.device = device
         
-        # MUCH LARGER network to maximize GPU utilization
-        self.net = nn.Sequential(
-            # First conv block - 256 channels
-            nn.Conv2d(1, 128, 3, padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(),
-            nn.Conv2d(128, 256, 3, padding=1),
-            nn.BatchNorm2d(256),
-            nn.ReLU(),
-            # Second conv block - 512 channels
-            nn.Conv2d(256, 512, 3, padding=1),
-            nn.BatchNorm2d(512),
-            nn.ReLU(),
-            nn.Conv2d(512, 512, 3, padding=1),
-            nn.BatchNorm2d(512),
-            nn.ReLU(),
-            # Third conv block - 512 channels
-            nn.Conv2d(512, 512, 3, padding=1),
-            nn.BatchNorm2d(512),
-            nn.ReLU(),
-            nn.Flatten(),
-            # Large FC layers
-            nn.Linear(512 * input_size, 4096),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(4096, 2048),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(2048, 1024),
-            nn.ReLU(),
-            nn.Linear(1024, 2 * input_size)
-        )
+        # Support multiple model sizes: 'small' (CPU-friendly), 'large' (GPU-focused)
+        # If model='auto' choose small for CPU and large for CUDA
+        if model == 'auto':
+            model = 'large' if (device is not None and device.type == 'cuda') else 'small'
+        self.model_type = model
+
+        if model == 'small':
+            # Small network suitable for fast CPU runs
+            self.net = nn.Sequential(
+                nn.Conv2d(1, 16, 3, padding=1),
+                nn.ReLU(),
+                nn.Conv2d(16, 32, 3, padding=1),
+                nn.ReLU(),
+                nn.Flatten(),
+                nn.Linear(32 * input_size, 256),
+                nn.ReLU(),
+                nn.Linear(256, 128),
+                nn.ReLU(),
+                nn.Linear(128, 2 * input_size)
+            )
+        else:
+            # MUCH LARGER network to maximize GPU utilization
+            self.net = nn.Sequential(
+                # First conv block - 256 channels
+                nn.Conv2d(1, 128, 3, padding=1),
+                nn.BatchNorm2d(128),
+                nn.ReLU(),
+                nn.Conv2d(128, 256, 3, padding=1),
+                nn.BatchNorm2d(256),
+                nn.ReLU(),
+                # Second conv block - 512 channels
+                nn.Conv2d(256, 512, 3, padding=1),
+                nn.BatchNorm2d(512),
+                nn.ReLU(),
+                nn.Conv2d(512, 512, 3, padding=1),
+                nn.BatchNorm2d(512),
+                nn.ReLU(),
+                # Third conv block - 512 channels
+                nn.Conv2d(512, 512, 3, padding=1),
+                nn.BatchNorm2d(512),
+                nn.ReLU(),
+                nn.Flatten(),
+                # Large FC layers
+                nn.Linear(512 * input_size, 4096),
+                nn.ReLU(),
+                nn.Dropout(0.2),
+                nn.Linear(4096, 2048),
+                nn.ReLU(),
+                nn.Dropout(0.2),
+                nn.Linear(2048, 1024),
+                nn.ReLU(),
+                nn.Linear(1024, 2 * input_size)
+            )
+        # Move network to device
         self.net.to(self.device)
-        # Create matching target network
-        self.target_net = nn.Sequential(
-            # First conv block - 256 channels
-            nn.Conv2d(1, 128, 3, padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(),
-            nn.Conv2d(128, 256, 3, padding=1),
-            nn.BatchNorm2d(256),
-            nn.ReLU(),
-            # Second conv block - 512 channels
-            nn.Conv2d(256, 512, 3, padding=1),
-            nn.BatchNorm2d(512),
-            nn.ReLU(),
-            nn.Conv2d(512, 512, 3, padding=1),
-            nn.BatchNorm2d(512),
-            nn.ReLU(),
-            # Third conv block - 512 channels
-            nn.Conv2d(512, 512, 3, padding=1),
-            nn.BatchNorm2d(512),
-            nn.ReLU(),
-            nn.Flatten(),
-            # Large FC layers
-            nn.Linear(512 * input_size, 4096),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(4096, 2048),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(2048, 1024),
-            nn.ReLU(),
-            nn.Linear(1024, 2 * input_size)
-        )
+        # Create matching target network with same architecture
+        # For simplicity we create a fresh instance by cloning the main net's structure
+        # If model is 'small', reuse same small architecture; otherwise create a large copy
+        # We'll create a new nn.Sequential matching self.net by recreating the same modules
+        # (Simpler approach: deep copy the module)
+        import copy
+        self.target_net = copy.deepcopy(self.net)
+        # Initialize target net weights from policy net
         self.target_net.load_state_dict(self.net.state_dict())
         self.target_net.to(self.device)
+
+        # Normalization for inputs (-3 to 9) -> roughly [-1, 1]
+        self.register_buffer('obs_mean', torch.tensor(0.0))
+        self.register_buffer('obs_std', torch.tensor(5.0))
+
+    def save(self, path, extra=None):
+        """Save the agent networks and basic config to a file."""
+        ckpt = {
+            'net': self.net.state_dict(),
+            'target': self.target_net.state_dict(),
+            'height': self.height,
+            'width': self.width,
+            'model': getattr(self, 'model_type', None)
+        }
+        if extra and isinstance(extra, dict):
+            ckpt.update(extra)
+        torch.save(ckpt, path)
+
+    @classmethod
+    def load_from_file(cls, path, device=None):
+        """Load an agent from a checkpoint file. Returns a MinesweeperAgent instance."""
+        # Normalize device to torch.device
+        if isinstance(device, str):
+            map_loc = torch.device(device)
+            device_torch = torch.device(device)
+        elif isinstance(device, torch.device):
+            map_loc = device
+            device_torch = device
+        else:
+            map_loc = torch.device('cpu')
+            device_torch = torch.device('cpu')
+
+        ckpt = torch.load(path, map_location=map_loc)
+        height = ckpt.get('height', 9)
+        width = ckpt.get('width', 9)
+        model = ckpt.get('model', 'auto')
+        agent = cls(height, width, device=device_torch, model=model)
+        agent.net.load_state_dict(ckpt['net'])
+        if 'target' in ckpt:
+            agent.target_net.load_state_dict(ckpt['target'])
+        return agent
         
         # Normalization for inputs (-3 to 9) -> roughly [-1, 1]
         self.register_buffer('obs_mean', torch.tensor(0.0))
@@ -89,8 +128,14 @@ class MinesweeperAgent(nn.Module):
 
     def forward(self, obs, use_target=False):
         obs = obs.float().to(self.device)
-        # Normalize inputs
-        obs = (obs - self.obs_mean) / self.obs_std
+        # Normalize inputs (fall back if buffers missing)
+        obs_mean = getattr(self, 'obs_mean', None)
+        obs_std = getattr(self, 'obs_std', None)
+        if obs_mean is None or obs_std is None:
+            # create local tensors on the same device
+            obs_mean = torch.tensor(0.0, device=self.device)
+            obs_std = torch.tensor(5.0, device=self.device)
+        obs = (obs - obs_mean) / obs_std
         if obs.dim() == 2:  # single (9,9)
             obs = obs.unsqueeze(0).unsqueeze(0)  # (1,1,9,9)
         elif obs.dim() == 3:  # batch (batch,9,9)
@@ -121,11 +166,12 @@ class MinesweeperAgent(nn.Module):
         valid = []
         for i in range(self.height):
             for j in range(self.width):
-                # Cell is hidden (-2) or flagged (-3)
-                if obs[i, j] == -2:  # Can reveal
+                # Can reveal if hidden (-2)
+                if obs[i, j] == -2:
                     valid.append(i * self.width + j)
-                # Can always try to flag/unflag (action >= height*width)
-                valid.append(self.height * self.width + i * self.width + j)
+                # Can flag/unflag only if not revealed
+                if obs[i, j] <= -2:
+                    valid.append(self.height * self.width + i * self.width + j)
         return valid if valid else list(range(2 * self.height * self.width))
     
     def _get_action_mask(self, obs):
